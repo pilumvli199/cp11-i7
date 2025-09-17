@@ -1,94 +1,98 @@
 #!/usr/bin/env python3
-# main.py - Robust SmartAPI import + login (try multiple import names, dump site-packages candidates)
+# main.py - Robust SmartAPI login (replace your current main.py with this)
 
 import os
 import sys
 import time
 import datetime
 import traceback
+import importlib
 
+# Debug: interpreter + path
 print("DEBUG: Python executable:", sys.executable)
 print("DEBUG: initial sys.path[:8]:", sys.path[:8])
 
-# --- helper to inspect site-packages for 'smart' related files ---
+# Small helper: optionally attempt runtime install for essentials (convenience only)
+def runtime_ensure(packages_map):
+    import subprocess
+    to_install = []
+    for pip_pkg, mods in packages_map.items():
+        ok = False
+        for m in mods:
+            try:
+                importlib.import_module(m)
+                ok = True
+                break
+            except Exception:
+                continue
+        if not ok:
+            to_install.append(pip_pkg)
+    if not to_install:
+        return True
+    print("INFO: Attempting runtime install for:", to_install)
+    try:
+        for pkg in to_install:
+            print("INFO: pip installing", pkg)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", pkg])
+        return True
+    except Exception as e:
+        print("WARN: runtime pip install failed:", e)
+        traceback.print_exc()
+        return False
+
+# Ensure minimal libs (optional)
+runtime_ensure({
+    "python-dotenv": ["dotenv"],
+    "pyotp": ["pyotp"],
+    "smartapi-python": ["SmartApi", "smartapi"],  # try both package names
+})
+
+# Inspect site-packages for smart* candidates (helpful to debug weird installs)
 def inspect_site_packages():
-    print("DEBUG: Inspecting sys.path for smartapi candidates...")
+    print("DEBUG: Inspecting sys.path for smart* candidates...")
     candidates = []
     for p in sys.path:
         try:
             if not p or not os.path.isdir(p):
                 continue
-            # consider only site-packages-like paths (heuristic)
-            lower = p.lower()
-            if "site-packages" not in lower and "dist-packages" not in lower:
-                # still check app root (it may shadow imports)
-                pass
             for name in os.listdir(p):
                 if "smart" in name.lower():
                     candidates.append(os.path.join(p, name))
-        except Exception as e:
-            # ignore permission/other issues
+        except Exception:
             continue
     print("DEBUG: Found candidates (first 200):")
     for c in candidates[:200]:
-        try:
-            print("  ", c)
-        except Exception:
-            print("  (path print error)")
+        print("  ", c)
     if not candidates:
         print("DEBUG: No smart* candidates found in sys.path entries scanned.")
     return candidates
 
-# run inspection early so logs show it
-cands = inspect_site_packages()
+candidates = inspect_site_packages()
 
-# --- Try multiple import names for smartapi ---
-import importlib
-
-possible_names = [
-    "smartapi",
-    "smartapi_python",
-    "SmartApi",
-    "smart_api",
-    "smartapitools",
-    "smartapi_python-1.5.5",  # unlikely, but include variants
-]
-
+# Try flexible imports — support both 'smartapi' (pypi smartapi-python) and legacy 'SmartApi' package dir
 SmartConnect = None
 import_errors = {}
+
+possible_names = ["smartapi", "SmartApi", "smartapi_python", "smart_api"]
 
 for name in possible_names:
     try:
         mod = importlib.import_module(name)
         print(f"DEBUG: Successful import as '{name}' -> {getattr(mod,'__file__', None)}")
-        # try to find SmartConnect symbol
         if hasattr(mod, "SmartConnect"):
             SmartConnect = getattr(mod, "SmartConnect")
             print(f"DEBUG: Found SmartConnect in module '{name}'.")
             break
-        # sometimes the package exposes submodule
-        if hasattr(mod, "webSocket") and hasattr(mod, "webSocket"):
-            # still attempt if class exists deeper
-            try:
-                sub = importlib.import_module(name + ".smartConnect")
-                if hasattr(sub, "SmartConnect"):
-                    SmartConnect = getattr(sub, "SmartConnect")
-                    print(f"DEBUG: Found SmartConnect in submodule '{name}.smartConnect'.")
-                    break
-            except Exception:
-                pass
-        # if not found, keep going
         import_errors[name] = "imported_but_no_SmartConnect"
     except Exception as e:
         import_errors[name] = f"{type(e).__name__}: {e}"
 
-# If not found yet, try scanning candidates for importable package paths and attempt import by path
-if SmartConnect is None and cands:
-    for path in cands:
-        # if path is a package dir, try to add its parent to sys.path and import basename
+# Try import from discovered candidate dirs (if above failed)
+if SmartConnect is None and candidates:
+    for path in candidates:
         base = os.path.basename(path)
-        parent = os.path.dirname(path)
         modname = os.path.splitext(base)[0]
+        parent = os.path.dirname(path)
         try:
             if parent not in sys.path:
                 sys.path.insert(0, parent)
@@ -100,40 +104,39 @@ if SmartConnect is None and cands:
                 break
         except Exception as e:
             import_errors[f"path::{path}"] = f"{type(e).__name__}: {e}"
-            # continue
 
-# After tries, report summary
-print("DEBUG: import_errors summary (first 200):")
-count = 0
-for k, v in import_errors.items():
-    if count > 200:
-        break
+print("DEBUG: import_errors summary (partial):")
+for k, v in list(import_errors.items())[:50]:
     print("  ", k, "->", v)
-    count += 1
 
 if SmartConnect is None:
     print("❌ Could not locate SmartConnect via tried imports. Final sys.path[:6]:", sys.path[:6])
-    print("---- End of import attempts. Paste these logs and the site-packages candidates above. ----")
-    # helpful pip freeze output for diagnosing build vs runtime mismatch
     try:
         import subprocess
         print("\n---- pip freeze ----")
         subprocess.call([sys.executable, "-m", "pip", "freeze"])
     except Exception:
         pass
-    # exit with non-zero so deployment log shows failure
     sys.exit(1)
 
-# If we reached here, we have SmartConnect
 print("✅ SmartConnect resolved:", SmartConnect)
 
-# ---------- proceed to load dotenv, creds and login ----------
+# Now import dotenv and pyotp (they should be available)
 try:
     from dotenv import load_dotenv
 except Exception:
-    print("WARN: python-dotenv not importable. Continuing (will rely on env variables).")
+    print("WARN: python-dotenv not importable; continuing (will use environment directly).")
 
-load_dotenv()
+try:
+    import pyotp
+except Exception:
+    print("WARN: pyotp not importable; TOTP generation will fail if used.")
+
+# Load env vars
+try:
+    load_dotenv()
+except Exception:
+    pass
 
 SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()
 SMARTAPI_CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "").strip()
@@ -147,12 +150,11 @@ print("DEBUG: SMARTAPI_PASSWORD present?:", bool(SMARTAPI_PASSWORD))
 print("DEBUG: SMARTAPI_TOTP_SECRET present?:", bool(SMARTAPI_TOTP_SECRET))
 
 if not SMARTAPI_CLIENT_CODE:
-    print("❌ Missing SMARTAPI_CLIENT_CODE. Set env and redeploy.")
+    print("❌ Missing SMARTAPI_CLIENT_CODE. Set the env var and redeploy.")
     sys.exit(1)
 
-# create SmartConnect instance (use SmartConnect from resolved module)
+# Initialize SmartConnect instance (robust)
 try:
-    # try constructor with api_key keyword first
     try:
         s = SmartConnect(api_key=SMARTAPI_API_KEY)
     except TypeError:
@@ -162,57 +164,66 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 
-# TOTP helper
-def login_try_password_totp(s):
-    import pyotp
-    if not SMARTAPI_PASSWORD or not SMARTAPI_TOTP_SECRET:
+# Login helpers
+def try_login_mpin():
+    if not SMARTAPI_MPIN:
         return None
-    totp = pyotp.TOTP(SMARTAPI_TOTP_SECRET)
+    try:
+        print("DEBUG: Attempting MPIN login...")
+        try:
+            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN, SMARTAPI_API_KEY)
+        except TypeError:
+            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN)
+        print("Login response (MPIN):", resp)
+        return resp
+    except Exception:
+        traceback.print_exc()
+        return None
+
+def try_login_password_totp():
+    if not SMARTAPI_PASSWORD or not SMARTAPI_TOTP_SECRET:
+        print("DEBUG: Password or TOTP secret missing; cannot attempt password+totp.")
+        return None
+    try:
+        totp_obj = pyotp.TOTP(SMARTAPI_TOTP_SECRET)
+    except Exception as e:
+        print("DEBUG: pyotp init error:", e)
+        return None
+
+    print("DEBUG: Local UTC time:", datetime.datetime.utcnow().isoformat())
     print("DEBUG: Local epoch:", int(time.time()))
-    print("DEBUG: Current TOTP:", totp.now())
+    print("DEBUG: Current TOTP (local):", totp_obj.now())
+
     epoch = int(time.time())
     for offset in (-30, 0, 30):
         try:
-            code = totp.at(epoch + offset)
+            code = totp_obj.at(epoch + offset)
         except Exception:
             code = None
         if not code:
             continue
+        code_str = str(code).zfill(6)
         try:
-            print("DEBUG: Trying totp:", code, "offset", offset)
-            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_PASSWORD, str(code).zfill(6))
-            print("Login resp:", resp)
+            print(f"DEBUG: Trying login with totp={code_str} (offset {offset}s)")
+            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_PASSWORD, code_str)
+            print("Login response (pwd+totp):", resp)
             if isinstance(resp, dict) and resp.get("status"):
                 return resp
         except Exception:
             traceback.print_exc()
     return None
 
-def login_try_mpin(s):
-    if not SMARTAPI_MPIN:
-        return None
-    try:
-        try:
-            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN, SMARTAPI_API_KEY)
-        except TypeError:
-            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN)
-        print("MPIN login resp:", resp)
-        return resp
-    except Exception:
-        traceback.print_exc()
-        return None
-
 def main():
     print("Starting login attempts...")
-    resp = login_try_mpin(s)
+    resp = try_login_mpin()
     if resp and isinstance(resp, dict) and resp.get("status"):
         print("✅ MPIN login successful.")
         return
-    resp2 = login_try_password_totp(s)
+    resp2 = try_login_password_totp()
     if resp2 and isinstance(resp2, dict) and resp2.get("status"):
         print("✅ Password+TOTP login successful.")
         return
-    print("❌ Login failed. See above logs.")
+    print("❌ Login failed. See above logs for exact server response.")
     sys.exit(1)
 
 if __name__ == "__main__":
