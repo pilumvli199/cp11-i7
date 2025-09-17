@@ -142,7 +142,6 @@ for offset_seconds, code in codes_to_try:
 
 if not login_response or not (isinstance(login_response, dict) and login_response.get("status")):
     print("❌ All login attempts failed. Last response:", login_response)
-    # do not raise here if you want the bot to continue; exit to be explicit
     sys.exit(1)
 
 # -----------------------
