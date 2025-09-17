@@ -1,3 +1,4 @@
+# core
 python-dotenv==1.0.1
 requests==2.32.3
 pyotp==2.9.0
@@ -10,8 +11,7 @@ websocket-client==1.8.0
 openai==1.0.0
 numpy==1.26.4
 
-# SmartAPI websocket dependencies
+# SmartAPI websocket dependencies (needed for smartapi websockets)
 twisted==22.10.0
 autobahn==23.6.2
 service-identity==21.1.0
-
