@@ -1,84 +1,153 @@
 #!/usr/bin/env python3
-# main.py - Indian Market Bot (SmartAPI + OpenAI + Telegram)
-# Supports MPIN login (preferred) or Password+TOTP fallback.
-# Fill values in .env (see .env.example).
+# main.py - Robust SmartAPI login with proper TOTP usage and debug prints
 
-import os, asyncio, json, time, traceback
-from datetime import datetime, timedelta
-from tempfile import NamedTemporaryFile
-
+import os
+import time
+import datetime
+import sys
+import traceback
 from dotenv import load_dotenv
+import pyotp
+
+# -----------------------
+# Load env
+# -----------------------
 load_dotenv()
 
-import requests
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.dates import date2num
+SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()
+SMARTAPI_CLIENT_ID = os.getenv("SMARTAPI_CLIENT_ID", "").strip()
+SMARTAPI_CLIENT_PWD = os.getenv("SMARTAPI_CLIENT_PWD", "").strip()
+SMARTAPI_TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "").strip()
 
-# optional libraries
+# Quick sanity
+if not SMARTAPI_API_KEY or not SMARTAPI_CLIENT_ID or not SMARTAPI_CLIENT_PWD:
+    print("❌ Missing SmartAPI credentials (API_KEY/CLIENT_ID/CLIENT_PWD). Check your .env.")
+    sys.exit(1)
+
+if not SMARTAPI_TOTP_SECRET:
+    print("❌ Missing SMARTAPI_TOTP_SECRET in .env. You must set the BASE32 TOTP secret from Angel/Authenticator app.")
+    sys.exit(1)
+
+# -----------------------
+# Imports that may fail
+# -----------------------
 try:
-    import aiohttp
-except Exception:
-    print("Missing aiohttp. Install with pip install aiohttp"); raise
+    # Strictly use lowercase package name
+    from smartapi import SmartConnect
+except Exception as e:
+    print("❌ Could not import smartapi. Have you installed requirements? (smartapi-python, twisted, autobahn...)")
+    traceback.print_exc()
+    raise
+
+# Check twisted presence for clearer error if missing
 try:
-    import pyotp
-except Exception:
-    print("Missing pyotp. Install with pip install pyotp"); raise
+    import twisted  # noqa: F401
+except ModuleNotFoundError:
+    print("❌ 'twisted' not installed — required for smartapi websockets. Add twisted, autobahn, service-identity to requirements.txt")
+    raise
+
+# -----------------------
+# Helper: validate base32-looking secret
+# -----------------------
+def looks_like_base32(s):
+    import re
+    return bool(re.fullmatch(r"[A-Z2-7]+=*", s.upper()))
+
+print("DEBUG: SMARTAPI_CLIENT_ID (first 12 chars):", SMARTAPI_CLIENT_ID[:12])
+print("DEBUG: SMARTAPI_API_KEY (first 12 chars):", SMARTAPI_API_KEY[:12])
+print("DEBUG: SMARTAPI_TOTP_SECRET (first 12 chars):", SMARTAPI_TOTP_SECRET[:12])
+print("DEBUG: TOTP secret looks like base32?:", looks_like_base32(SMARTAPI_TOTP_SECRET))
+
+# -----------------------
+# Create SmartConnect (robust)
+# -----------------------
 try:
     try:
-        from SmartApi import SmartConnect
-    except Exception:
-        from smartapi import SmartConnect
+        s = SmartConnect(api_key=SMARTAPI_API_KEY)
+    except TypeError:
+        # fallback if constructor signature is different
+        s = SmartConnect(SMARTAPI_API_KEY)
 except Exception:
-    print("Missing SmartAPI library. Install smartapi-python and its deps"); raise
-try:
-    import openai
-except Exception:
-    openai = None
+    print("❌ SmartConnect init failed. Full traceback below:")
+    traceback.print_exc()
+    raise
 
-# ---------------- CONFIG ----------------
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# -----------------------
+# Generate TOTP (and try ±1 window for clock drift)
+# -----------------------
+totp_obj = pyotp.TOTP(SMARTAPI_TOTP_SECRET)
 
-SMARTAPI_CLIENT_CODE = os.getenv('SMARTAPI_CLIENT_ID') or os.getenv('SMARTAPI_CLIENT_CODE')
-SMARTAPI_API_KEY = os.getenv('SMARTAPI_API_KEY')
-SMARTAPI_API_SECRET = os.getenv('SMARTAPI_API_SECRET')
-SMARTAPI_MPIN = os.getenv('SMARTAPI_MPIN')
-SMARTAPI_PASSWORD = os.getenv('SMARTAPI_PASSWORD')
-SMARTAPI_TOTP_SECRET = os.getenv('SMARTAPI_TOTP_SECRET')
+# show local times for debugging
+print("DEBUG: Local UTC time:", datetime.datetime.utcnow().isoformat())
+print("DEBUG: Local epoch:", int(time.time()))
 
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL','gpt-4o-mini')
-if openai and OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# current code
+current_code = totp_obj.now()
+print("DEBUG: Current TOTP (local):", current_code)   # should be 6 digits
 
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL',120))
-SIGNAL_CONF_THRESHOLD = float(os.getenv('SIGNAL_CONF_THRESHOLD',70))
-
-# minimal main - login check only
-async def main():
-    print("Starting minimal bot...")
+# generate codes to try (current and ±1 step)
+epoch = int(time.time())
+codes_to_try = []
+for offset in (-30, 0, 30):
+    t = epoch + offset
     try:
-        # attempt SmartAPI import/login
-        try:
-            s = SmartConnect(api_key=SMARTAPI_API_KEY)
-        except Exception as e:
-            print("SmartAPI import/connect error:", e)
-            return
-        if SMARTAPI_MPIN:
-            try:
-                resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN, SMARTAPI_API_SECRET)
-            except TypeError:
-                resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN)
-        else:
-            if not (SMARTAPI_PASSWORD and SMARTAPI_TOTP_SECRET):
-                print("MPIN not set and password/totp missing. Exiting.")
-                return
-            totp = pyotp.TOTP(SMARTAPI_TOTP_SECRET).now()
-            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_PASSWORD, totp)
-        print("Login response:", resp)
+        codes_to_try.append((offset, totp_obj.at(t)))
     except Exception as e:
-        print("Main exception:", e)
+        print("DEBUG: pyotp.at() error:", e)
+        codes_to_try.append((offset, None))
 
-if __name__ == '__main__':
-    asyncio.run(main())
+print("DEBUG: Codes to try (offset seconds, code):", codes_to_try)
+
+# -----------------------
+# Clean & prepare clientcode/password values
+# -----------------------
+# Remove stray quotes or whitespace that may have crept in
+clientcode_clean = SMARTAPI_CLIENT_ID.strip().strip('"').strip("'")
+password_clean = SMARTAPI_CLIENT_PWD.strip().strip('"').strip("'")
+
+print("DEBUG: clientcode_clean:", clientcode_clean)
+# avoid printing password in logs in production; printing truncated for debug
+print("DEBUG: password_clean (first 4 chars):", password_clean[:4] + ("***" if len(password_clean) > 4 else ""))
+
+# -----------------------
+# Try login with each totp candidate
+# -----------------------
+login_response = None
+for offset_seconds, code in codes_to_try:
+    if not code:
+        continue
+    # ensure code is a 6-digit string
+    code_str = str(code).zfill(6)
+    request_body = {
+        "clientcode": clientcode_clean,
+        "password": password_clean,
+        "totp": code_str
+    }
+    print(f"DEBUG: Trying login with totp={code_str} (offset {offset_seconds}s). Request body:", request_body)
+    try:
+        resp = s.generateSession(clientcode_clean, password_clean, code_str)
+        print("Login response:", resp)
+        login_response = resp
+        # check success
+        if isinstance(resp, dict) and resp.get("status"):
+            print("✅ Login successful.")
+            break
+        else:
+            print("❌ Login failed for this code. Server message:", resp.get("message") if isinstance(resp, dict) else resp)
+    except Exception as e:
+        print("Exception during generateSession call:", e)
+        traceback.print_exc()
+        login_response = {"status": False, "message": str(e)}
+        # continue trying other codes
+
+if not login_response or not (isinstance(login_response, dict) and login_response.get("status")):
+    print("❌ All login attempts failed. Last response:", login_response)
+    # do not raise here if you want the bot to continue; exit to be explicit
+    sys.exit(1)
+
+# -----------------------
+# Continue with bot logic...
+# -----------------------
+print("Bot ready — continue with market data / subscriptions ...")
+# your further logic starts below this line
+# --------------------------------------------------
