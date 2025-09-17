@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Robust SmartAPI login (replace your current main.py with this)
+# main.py - Fixed MPIN usage + safe backoff + robust TOTP handling
 
 import os
 import sys
@@ -8,15 +8,14 @@ import datetime
 import traceback
 import importlib
 
-# Debug: interpreter + path
 print("DEBUG: Python executable:", sys.executable)
 print("DEBUG: initial sys.path[:8]:", sys.path[:8])
 
-# Small helper: optionally attempt runtime install for essentials (convenience only)
-def runtime_ensure(packages_map):
+# Minimal runtime ensure (convenience)
+def runtime_ensure(pkgs_map):
     import subprocess
     to_install = []
-    for pip_pkg, mods in packages_map.items():
+    for pip_pkg, mods in pkgs_map.items():
         ok = False
         for m in mods:
             try:
@@ -29,26 +28,24 @@ def runtime_ensure(packages_map):
             to_install.append(pip_pkg)
     if not to_install:
         return True
-    print("INFO: Attempting runtime install for:", to_install)
     try:
-        for pkg in to_install:
-            print("INFO: pip installing", pkg)
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", pkg])
+        for p in to_install:
+            print("INFO: pip installing", p)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", p])
         return True
     except Exception as e:
-        print("WARN: runtime pip install failed:", e)
-        traceback.print_exc()
+        print("WARN: runtime install failed:", e)
         return False
 
-# Ensure minimal libs (optional)
 runtime_ensure({
     "python-dotenv": ["dotenv"],
     "pyotp": ["pyotp"],
-    "smartapi-python": ["SmartApi", "smartapi"],  # try both package names
+    "smartapi-python": ["SmartApi", "smartapi"],
 })
 
-# Inspect site-packages for smart* candidates (helpful to debug weird installs)
+# inspect site-packages candidates (helpful for debug)
 def inspect_site_packages():
+    import os
     print("DEBUG: Inspecting sys.path for smart* candidates...")
     candidates = []
     for p in sys.path:
@@ -59,58 +56,30 @@ def inspect_site_packages():
                 if "smart" in name.lower():
                     candidates.append(os.path.join(p, name))
         except Exception:
-            continue
-    print("DEBUG: Found candidates (first 200):")
+            pass
     for c in candidates[:200]:
         print("  ", c)
-    if not candidates:
-        print("DEBUG: No smart* candidates found in sys.path entries scanned.")
     return candidates
 
-candidates = inspect_site_packages()
+inspect_site_packages()
 
-# Try flexible imports — support both 'smartapi' (pypi smartapi-python) and legacy 'SmartApi' package dir
+# Try flexible imports
 SmartConnect = None
-import_errors = {}
-
 possible_names = ["smartapi", "SmartApi", "smartapi_python", "smart_api"]
-
 for name in possible_names:
     try:
         mod = importlib.import_module(name)
-        print(f"DEBUG: Successful import as '{name}' -> {getattr(mod,'__file__', None)}")
+        print(f"DEBUG: Imported {name} -> {getattr(mod,'__file__', None)}")
         if hasattr(mod, "SmartConnect"):
             SmartConnect = getattr(mod, "SmartConnect")
-            print(f"DEBUG: Found SmartConnect in module '{name}'.")
+            print(f"DEBUG: Found SmartConnect in {name}")
             break
-        import_errors[name] = "imported_but_no_SmartConnect"
     except Exception as e:
-        import_errors[name] = f"{type(e).__name__}: {e}"
-
-# Try import from discovered candidate dirs (if above failed)
-if SmartConnect is None and candidates:
-    for path in candidates:
-        base = os.path.basename(path)
-        modname = os.path.splitext(base)[0]
-        parent = os.path.dirname(path)
-        try:
-            if parent not in sys.path:
-                sys.path.insert(0, parent)
-            mod = importlib.import_module(modname)
-            print(f"DEBUG: Imported by path basename '{modname}' -> {getattr(mod,'__file__',None)}")
-            if hasattr(mod, "SmartConnect"):
-                SmartConnect = getattr(mod, "SmartConnect")
-                print(f"DEBUG: Found SmartConnect in module imported from path '{path}'.")
-                break
-        except Exception as e:
-            import_errors[f"path::{path}"] = f"{type(e).__name__}: {e}"
-
-print("DEBUG: import_errors summary (partial):")
-for k, v in list(import_errors.items())[:50]:
-    print("  ", k, "->", v)
+        # ignore and continue
+        pass
 
 if SmartConnect is None:
-    print("❌ Could not locate SmartConnect via tried imports. Final sys.path[:6]:", sys.path[:6])
+    print("❌ Could not import SmartConnect. Aborting.")
     try:
         import subprocess
         print("\n---- pip freeze ----")
@@ -119,24 +88,18 @@ if SmartConnect is None:
         pass
     sys.exit(1)
 
-print("✅ SmartConnect resolved:", SmartConnect)
-
-# Now import dotenv and pyotp (they should be available)
+# dotenv + pyotp
 try:
     from dotenv import load_dotenv
 except Exception:
-    print("WARN: python-dotenv not importable; continuing (will use environment directly).")
-
+    load_dotenv = None
 try:
     import pyotp
 except Exception:
-    print("WARN: pyotp not importable; TOTP generation will fail if used.")
+    pyotp = None
 
-# Load env vars
-try:
+if load_dotenv:
     load_dotenv()
-except Exception:
-    pass
 
 SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()
 SMARTAPI_CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "").strip()
@@ -150,10 +113,10 @@ print("DEBUG: SMARTAPI_PASSWORD present?:", bool(SMARTAPI_PASSWORD))
 print("DEBUG: SMARTAPI_TOTP_SECRET present?:", bool(SMARTAPI_TOTP_SECRET))
 
 if not SMARTAPI_CLIENT_CODE:
-    print("❌ Missing SMARTAPI_CLIENT_CODE. Set the env var and redeploy.")
+    print("❌ Missing SMARTAPI_CLIENT_CODE. Set env var and redeploy.")
     sys.exit(1)
 
-# Initialize SmartConnect instance (robust)
+# create SmartConnect instance
 try:
     try:
         s = SmartConnect(api_key=SMARTAPI_API_KEY)
@@ -164,66 +127,98 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 
-# Login helpers
-def try_login_mpin():
+# Utility: sleep with exponential backoff (capped)
+def backoff_sleep(attempt, base=1.0, cap=16.0):
+    delay = min(cap, base * (2 ** attempt))
+    print(f"DEBUG: Backoff sleeping {delay:.1f}s (attempt {attempt})")
+    time.sleep(delay)
+
+# Helper: try MPIN login correctly (do NOT pass API key as third arg)
+def try_login_mpin(max_retries=3):
     if not SMARTAPI_MPIN:
         return None
-    try:
-        print("DEBUG: Attempting MPIN login...")
+    attempt = 0
+    while attempt < max_retries:
         try:
-            resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN, SMARTAPI_API_KEY)
-        except TypeError:
+            print("DEBUG: Trying MPIN login (call with 2 args only)...")
+            # IMPORTANT: call generateSession with (clientcode, mpin) ONLY
             resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN)
-        print("Login response (MPIN):", resp)
-        return resp
-    except Exception:
-        traceback.print_exc()
-        return None
+            print("Login response (MPIN):", resp)
+            return resp
+        except Exception as e:
+            # handle known error messages / rate limit
+            msg = str(e)
+            print("Exception during MPIN login:", msg)
+            # if rate-limited, backoff more
+            if "exceeding access rate" in msg.lower() or "access denied" in msg.lower():
+                backoff_sleep(attempt, base=2.0, cap=60.0)
+            else:
+                backoff_sleep(attempt)
+            attempt += 1
+    return None
 
-def try_login_password_totp():
+# Helper: try password + TOTP (only when allowed)
+def try_login_password_totp(max_retries=2):
     if not SMARTAPI_PASSWORD or not SMARTAPI_TOTP_SECRET:
-        print("DEBUG: Password or TOTP secret missing; cannot attempt password+totp.")
+        print("DEBUG: password or totp secret missing - skipping pwd+totp")
         return None
-    try:
-        totp_obj = pyotp.TOTP(SMARTAPI_TOTP_SECRET)
-    except Exception as e:
-        print("DEBUG: pyotp init error:", e)
+    if pyotp is None:
+        print("WARN: pyotp not installed - cannot generate TOTP")
         return None
 
-    print("DEBUG: Local UTC time:", datetime.datetime.utcnow().isoformat())
-    print("DEBUG: Local epoch:", int(time.time()))
-    print("DEBUG: Current TOTP (local):", totp_obj.now())
-
-    epoch = int(time.time())
-    for offset in (-30, 0, 30):
+    totp_obj = pyotp.TOTP(SMARTAPI_TOTP_SECRET)
+    # try current and ±30s, but do not hammer server: include small sleeps
+    offsets = [-30, 0, 30]
+    for i, offset in enumerate(offsets):
         try:
-            code = totp_obj.at(epoch + offset)
-        except Exception:
-            code = None
-        if not code:
+            code = totp_obj.at(int(time.time()) + offset)
+        except Exception as e:
+            print("WARN: pyotp.at() error:", e)
             continue
         code_str = str(code).zfill(6)
         try:
-            print(f"DEBUG: Trying login with totp={code_str} (offset {offset}s)")
+            print(f"DEBUG: Trying password+totp with totp={code_str} (offset {offset})")
             resp = s.generateSession(SMARTAPI_CLIENT_CODE, SMARTAPI_PASSWORD, code_str)
             print("Login response (pwd+totp):", resp)
-            if isinstance(resp, dict) and resp.get("status"):
-                return resp
-        except Exception:
-            traceback.print_exc()
+            # If server explicitly says password login not allowed, stop further tries
+            if isinstance(resp, dict):
+                if resp.get("message") and "LoginbyPassword is not allowed" in str(resp.get("message")):
+                    print("DEBUG: Server forbids password login; stop password attempts")
+                    return resp
+                if resp.get("status"):
+                    return resp
+            # small sleep to avoid rate-limit
+            time.sleep(1.0)
+        except Exception as e:
+            err = str(e)
+            print("Exception during pwd+totp attempt:", err)
+            # JSON decode error sometimes indicates a plain-text error like "Access denied..." — respect backoff
+            if "exceeding access rate" in err.lower() or "access denied" in err.lower():
+                print("DEBUG: Detected rate-limit message from server. Backing off.")
+                time.sleep(5 + i * 5)
+            else:
+                time.sleep(1.0)
+            continue
     return None
 
+# Main flow
 def main():
-    print("Starting login attempts...")
-    resp = try_login_mpin()
+    print("Starting login flow at", datetime.datetime.utcnow().isoformat())
+    # 1) Try MPIN first (server prefers MPIN)
+    resp = try_login_mpin(max_retries=4)
     if resp and isinstance(resp, dict) and resp.get("status"):
         print("✅ MPIN login successful.")
         return
-    resp2 = try_login_password_totp()
+
+    # If MPIN failed or not provided, try password+totp
+    resp2 = try_login_password_totp(max_retries=2)
     if resp2 and isinstance(resp2, dict) and resp2.get("status"):
         print("✅ Password+TOTP login successful.")
         return
-    print("❌ Login failed. See above logs for exact server response.")
+
+    # if server explicitly forbids password login, and MPIN failed, surface the server messages
+    print("❌ Login failed. MPIN resp:", resp, "pwd+totp resp:", resp2)
+    # If we hit rate-limit, avoid immediate restart; exit so orchestrator can restart later
     sys.exit(1)
 
 if __name__ == "__main__":
